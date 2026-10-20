@@ -3,28 +3,43 @@ package com.javampire.openscad.editor;
 import org.cef.browser.CefBrowser;
 import org.jetbrains.annotations.NotNull;
 
-import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.Map;
+import java.util.UUID;
 
 /**
  * Sends preview source payloads from Java to the JCEF JavaScript preview runtime.
  */
 public final class OpenSCADPreviewWasmBridge {
 
+    private static final int SCRIPT_CHUNK_SIZE = 256 * 1024;
+
     private OpenSCADPreviewWasmBridge() {
     }
 
     public static void render(@NotNull final CefBrowser browser, @NotNull final OpenSCADPreviewSourceCollector.PreviewSources sources) {
         final String json = toJson(sources);
-        final String encoded = Base64.getEncoder().encodeToString(json.getBytes(StandardCharsets.UTF_8));
         final String frameUrl = browser.getURL();
+        final String transferId = UUID.randomUUID().toString();
+        final int chunkCount = (json.length() + SCRIPT_CHUNK_SIZE - 1) / SCRIPT_CHUNK_SIZE;
         browser.executeJavaScript(
-                "(function(){"
-                        + "var payload=JSON.parse(atob('" + encoded + "'));"
-                        + "if(typeof window.renderPreview==='function'){window.renderPreview(payload);}"
-                        + "else{console.error('renderPreview is not available');}"
-                        + "})();",
+                "window.beginPreviewPayloadTransfer("
+                        + quote(transferId) + "," + chunkCount + "," + json.length() + ");",
+                frameUrl,
+                0
+        );
+        for (int index = 0; index < chunkCount; index++) {
+            final int start = index * SCRIPT_CHUNK_SIZE;
+            final String chunk = json.substring(start, Math.min(start + SCRIPT_CHUNK_SIZE, json.length()));
+            browser.executeJavaScript(
+                    "window.appendPreviewPayloadChunk("
+                            + quote(transferId) + "," + index + "," + chunk.length() + "," + quote(chunk) + ");",
+                    frameUrl,
+                    0
+            );
+        }
+        browser.executeJavaScript(
+                "window.finishPreviewPayloadTransfer(" + quote(transferId) + ");",
                 frameUrl,
                 0
         );
@@ -36,7 +51,9 @@ public final class OpenSCADPreviewWasmBridge {
         json.append("{\"mainPath\":").append(quote(sources.mainPath()))
                 .append(",\"loadPreviewFonts\":").append(sources.loadPreviewFonts())
                 .append(",\"enableTextMetrics\":").append(sources.enableTextMetrics())
-                .append(",\"userFonts\":{");
+                .append(",\"assets\":{");
+        appendBase64Map(json, sources.assets());
+        json.append("},\"userFonts\":{");
         appendBase64Map(json, sources.userFonts());
         json.append("},\"files\":{");
         boolean first = true;
@@ -73,6 +90,8 @@ public final class OpenSCADPreviewWasmBridge {
                 case '\n' -> quoted.append("\\n");
                 case '\r' -> quoted.append("\\r");
                 case '\t' -> quoted.append("\\t");
+                case '\u2028' -> quoted.append("\\u2028");
+                case '\u2029' -> quoted.append("\\u2029");
                 default -> {
                     if (c < 0x20) {
                         quoted.append(String.format("\\u%04x", (int)c));

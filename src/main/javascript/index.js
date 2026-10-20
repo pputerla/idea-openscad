@@ -1494,6 +1494,79 @@ const loader = new STLLoader();
 let previewWorker = null;
 let previewGeneration = 0;
 let previewWasmReady = false;
+const previewPayloadTransfers = new Map();
+
+function reportPreviewPayloadTransferError(error) {
+  const message = "Could not transfer preview files to WebAssembly: "
+    + (error instanceof Error ? error.message : String(error));
+  console.error(message);
+  clearPreviewStatus();
+  reportPreviewIssue("error", message);
+  appendPreviewLog(message, "stderr");
+  window.cefQuery({ request: message });
+}
+
+window.beginPreviewPayloadTransfer = function beginPreviewPayloadTransfer(id, chunkCount, totalLength) {
+  previewPayloadTransfers.clear();
+  if (
+    typeof id !== "string"
+    || !Number.isInteger(chunkCount)
+    || chunkCount < 1
+    || !Number.isInteger(totalLength)
+    || totalLength < 1
+  ) {
+    reportPreviewPayloadTransferError("Invalid payload transfer metadata.");
+    return;
+  }
+  previewPayloadTransfers.set(id, {
+    chunks: new Array(chunkCount),
+    chunkCount,
+    receivedChunks: 0,
+    totalLength,
+  });
+};
+
+window.appendPreviewPayloadChunk = function appendPreviewPayloadChunk(id, index, expectedLength, chunk) {
+  const transfer = previewPayloadTransfers.get(id);
+  if (
+    !transfer
+    || !Number.isInteger(index)
+    || index < 0
+    || index >= transfer.chunkCount
+    || !Number.isInteger(expectedLength)
+    || typeof chunk !== "string"
+    || chunk.length !== expectedLength
+    || transfer.chunks[index] !== undefined
+  ) {
+    reportPreviewPayloadTransferError("A payload chunk was missing, truncated, or duplicated.");
+    return;
+  }
+  transfer.chunks[index] = chunk;
+  transfer.receivedChunks += 1;
+};
+
+window.finishPreviewPayloadTransfer = function finishPreviewPayloadTransfer(id) {
+  const transfer = previewPayloadTransfers.get(id);
+  previewPayloadTransfers.delete(id);
+  if (!transfer) {
+    reportPreviewPayloadTransferError("The payload transfer could not be started.");
+    return;
+  }
+  if (transfer.receivedChunks !== transfer.chunkCount) {
+    reportPreviewPayloadTransferError("The payload transfer was incomplete.");
+    return;
+  }
+  const payloadJson = transfer.chunks.join("");
+  if (payloadJson.length !== transfer.totalLength) {
+    reportPreviewPayloadTransferError("The payload length did not match the transferred data.");
+    return;
+  }
+  try {
+    window.renderPreview(JSON.parse(payloadJson));
+  } catch (error) {
+    reportPreviewPayloadTransferError(error);
+  }
+};
 
 function resetPreviewWorker() {
   if (previewWorker) {
@@ -1581,6 +1654,7 @@ window.renderPreview = function renderPreview(payload) {
     generation,
     mainPath: payload.mainPath,
     files,
+    assets: payload.assets ?? {},
     enableTextMetrics: Boolean(payload.enableTextMetrics),
     loadPreviewFonts: Boolean(payload.loadPreviewFonts),
     userFonts: payload.userFonts ?? {},

@@ -50,7 +50,9 @@ On macOS, the default install location is usually:
 
 ## Preview panel
 
-The split preview editor lets you edit `.scad` files and see the result in the IDE without launching native OpenSCAD. Rendering runs **openscad-wasm** (Manifold backend) in a JCEF Web Worker; project `use` / `include` dependencies are bundled into a virtual filesystem for the WASM runtime.
+The split preview editor lets you edit `.scad` files and see the result in the IDE without launching native OpenSCAD. Rendering runs **openscad-wasm** (Manifold backend) in a JCEF Web Worker; project `use` / `include` dependencies are bundled into a virtual filesystem for the WASM runtime. On each refresh, regular files under the active `.scad` file's directory are also snapshotted into `/work`, so `import()` can use paths computed at runtime. This snapshot is limited to 128 MiB in total, and symbolic links are excluded.
+
+The preview uses a per-refresh snapshot rather than lazy host-filesystem access: the Web Worker cannot directly read the IDE's filesystem, and OpenSCAD performs synchronous file reads inside WebAssembly.
 
 You can manually refresh the preview by clicking on the ![Refresh icon](/src/main/resources/com/javampire/openscad/icons/refresh.svg) button in the preview panel or in the editor context menu.
 Alternatively, you can activate the auto refresh with the button ![Autorefresh icon](/src/main/resources/com/javampire/openscad/icons/autoRefresh.svg) which refresh the preview at every file save.

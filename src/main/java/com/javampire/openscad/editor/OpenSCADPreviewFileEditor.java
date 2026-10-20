@@ -251,6 +251,10 @@ public class OpenSCADPreviewFileEditor extends UserDataHolderBase implements Fil
                         LOG.warn("Failed to collect preview sources for " + scadFile.getPath());
                         return;
                     }
+                    if (sources.errorMessage() != null) {
+                        showPreviewError(sources.errorMessage());
+                        return;
+                    }
                     OpenSCADPreviewWasmBridge.render(browser, sources);
                 })
                 .submit(AppExecutorUtil.getAppExecutorService());
