@@ -1,19 +1,43 @@
 /** @type {object | null} */
 let openscadInstance = null;
 let rendering = false;
-/** @type {{ generation: number, mainPath: string, files: Record<string, string> } | null} */
+/** @type {{ generation: number, mainPath: string, files: Record<string, string>, assets: Record<string, string> } | null} */
 let pendingRequest = null;
 
 /** @type {boolean} */
 let previewFontsLoaded = false;
 
-function ensureDir(instance, filePath) {
+/** @type {Set<string>} */
+let mountedWorkFiles = new Set();
+
+/** @type {Set<string>} */
+let mountedWorkDirectories = new Set();
+
+function assertWorkPath(path) {
+  const parts = typeof path === "string" ? path.split("/") : [];
+  if (
+    typeof path !== "string"
+    || !path.startsWith("/work/")
+    || parts[0] !== ""
+    || parts[1] !== "work"
+    || parts.length < 3
+    || parts.slice(2).some((part) => !part || part === "." || part === "..")
+    || path.includes("\0")
+  ) {
+    throw new Error(`Invalid preview filesystem path: ${String(path)}`);
+  }
+}
+
+function ensureDir(instance, filePath, trackWorkDirectory = false) {
   const parts = filePath.split("/").filter(Boolean);
   let current = "";
   for (let i = 0; i < parts.length - 1; i++) {
     current += "/" + parts[i];
     try {
       instance.FS.mkdir(current);
+      if (trackWorkDirectory) {
+        mountedWorkDirectories.add(current);
+      }
     } catch {
       // Directory already exists.
     }
@@ -30,15 +54,20 @@ function unlinkIfExists(instance, path) {
 
 function mountFiles(instance, files) {
   for (const [path, content] of Object.entries(files)) {
-    ensureDir(instance, path);
+    assertWorkPath(path);
+    ensureDir(instance, path, true);
     unlinkIfExists(instance, path);
     instance.FS.writeFile(path, content);
+    mountedWorkFiles.add(path);
   }
 }
 
-function mountBinaryFiles(instance, files) {
+function mountBinaryFiles(instance, files, isWorkFile = false) {
   for (const [path, base64] of Object.entries(files)) {
-    ensureDir(instance, path);
+    if (isWorkFile) {
+      assertWorkPath(path);
+    }
+    ensureDir(instance, path, isWorkFile);
     unlinkIfExists(instance, path);
     const binary = atob(base64);
     const bytes = new Uint8Array(binary.length);
@@ -46,7 +75,26 @@ function mountBinaryFiles(instance, files) {
       bytes[i] = binary.charCodeAt(i);
     }
     instance.FS.writeFile(path, bytes);
+    if (isWorkFile) {
+      mountedWorkFiles.add(path);
+    }
   }
+}
+
+function clearMountedWorkFiles(instance) {
+  for (const path of mountedWorkFiles) {
+    unlinkIfExists(instance, path);
+  }
+  mountedWorkFiles.clear();
+  const directories = [...mountedWorkDirectories].sort((left, right) => right.length - left.length);
+  for (const path of directories) {
+    try {
+      instance.FS.rmdir(path);
+    } catch {
+      // Keep directories that still contain files created by the WASM runtime.
+    }
+  }
+  mountedWorkDirectories.clear();
 }
 
 /** @param {string[]} logs */
@@ -98,6 +146,8 @@ async function getOpenSCADInstance(print, printErr) {
 function discardOpenSCADInstance() {
   openscadInstance = null;
   previewFontsLoaded = false;
+  mountedWorkFiles = new Set();
+  mountedWorkDirectories = new Set();
 }
 
 async function ensurePreviewFonts(instance, userFonts) {
@@ -119,7 +169,7 @@ async function ensurePreviewFonts(instance, userFonts) {
 
 async function renderNow(request) {
   rendering = true;
-  const { generation, mainPath, files, loadPreviewFonts, enableTextMetrics, userFonts } = request;
+  const { generation, mainPath, files, assets, loadPreviewFonts, enableTextMetrics, userFonts } = request;
   const outputPath = `/preview-${generation}.stl`;
   /** @type {string[]} */
   const renderLogs = [];
@@ -130,6 +180,7 @@ async function renderNow(request) {
   };
 
   try {
+    assertWorkPath(mainPath);
     const instance = await getOpenSCADInstance(
       (text) => appendLog(text, "stdout"),
       (text) => appendLog(text, "stderr"),
@@ -139,10 +190,12 @@ async function renderNow(request) {
     self.postMessage({
       type: "status",
       message:
-        fileCount === 1
+        fileCount === 1 && Object.keys(assets).length === 0
           ? "Mounting project file..."
-          : `Mounting ${fileCount} project files...`,
+          : `Mounting ${fileCount + Object.keys(assets).length} project files...`,
     });
+    clearMountedWorkFiles(instance);
+    mountBinaryFiles(instance, assets, true);
     mountFiles(instance, files);
     unlinkIfExists(instance, outputPath);
 
@@ -211,7 +264,7 @@ async function renderNow(request) {
 }
 
 self.onmessage = (event) => {
-  const { type, generation, mainPath, files, loadPreviewFonts, enableTextMetrics, userFonts } = event.data;
+  const { type, generation, mainPath, files, assets, loadPreviewFonts, enableTextMetrics, userFonts } = event.data;
   if (type !== "render") {
     return;
   }
@@ -219,7 +272,8 @@ self.onmessage = (event) => {
   const request = {
     generation,
     mainPath,
-    files,
+    files: files ?? {},
+    assets: assets ?? {},
     loadPreviewFonts: Boolean(loadPreviewFonts),
     enableTextMetrics: Boolean(enableTextMetrics),
     userFonts: userFonts ?? {},

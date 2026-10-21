@@ -20,7 +20,16 @@ import com.javampire.openscad.settings.OpenSCADSettings;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -42,6 +51,9 @@ public final class OpenSCADPreviewSourceCollector {
 
     private static final Logger LOG = Logger.getInstance(OpenSCADPreviewSourceCollector.class);
     private static final String WORK_ROOT = "/work";
+    static final long MAX_PREVIEW_ASSET_BYTES = 128L * 1024L * 1024L;
+    private static final String PREVIEW_ASSET_LIMIT_MESSAGE =
+            "Preview files in this directory exceed the 128 MiB limit. Remove some files and refresh the preview.";
     private static final Pattern IMPORT_PATTERN = Pattern.compile("\\b(?:use|include)\\s*<([^>]+)>");
     private static final Pattern TEXTMETRICS_PATTERN = Pattern.compile("\\b(?:textmetrics|fontmetrics)\\s*\\(");
     private static final Pattern PREVIEW_FONTS_PATTERN = Pattern.compile(
@@ -51,8 +63,9 @@ public final class OpenSCADPreviewSourceCollector {
     private OpenSCADPreviewSourceCollector() {
     }
 
-    public record PreviewSources(@NotNull String mainPath, @NotNull Map<String, String> files, boolean loadPreviewFonts, boolean enableTextMetrics,
-            @NotNull Map<String, byte[]> userFonts) {}
+    public record PreviewSources(@NotNull String mainPath, @NotNull Map<String, String> files, @NotNull Map<String, byte[]> assets,
+            boolean loadPreviewFonts, boolean enableTextMetrics, @NotNull Map<String, byte[]> userFonts,
+            @Nullable String errorMessage) {}
 
     private record PendingFile(@NotNull String virtualPath, @Nullable PsiFile psiFile, @Nullable VirtualFile virtualFile) {}
 
@@ -121,11 +134,129 @@ public final class OpenSCADPreviewSourceCollector {
             }
         }
 
+        final Map<String, byte[]> assets;
+        try {
+            final VirtualFile scadDirectory = scadFile.getParent();
+            assets = scadDirectory == null || !scadDirectory.isInLocalFileSystem()
+                    ? Map.of()
+                    : collectAssets(
+                            Path.of(scadDirectory.getPath()),
+                            parentVirtualPath(mainPath),
+                            files
+                    );
+        }
+        catch (PreviewAssetLimitException e) {
+            LOG.warn("OpenSCAD preview: " + PREVIEW_ASSET_LIMIT_MESSAGE + " (" + scadFile.getPath() + ")");
+            return new PreviewSources(mainPath, Map.of(), Map.of(), false, false, Map.of(), PREVIEW_ASSET_LIMIT_MESSAGE);
+        }
+
         final boolean loadPreviewFonts = requiresPreviewFonts(files);
         final Map<String, byte[]> userFonts = loadPreviewFonts
                 ? OpenSCADPreviewFontCollector.collectUserFonts(OpenSCADSettings.getInstance().getPreviewFontDirectories())
                 : Map.of();
-        return new PreviewSources(mainPath, files, loadPreviewFonts, requiresTextMetrics(files), userFonts);
+        return new PreviewSources(mainPath, files, assets, loadPreviewFonts, requiresTextMetrics(files), userFonts, null);
+    }
+
+    @NotNull
+    static Map<String, byte[]> collectAssets(@NotNull final Path sourceDirectory, @NotNull final String virtualDirectory,
+                                              @NotNull final Map<String, String> sourceFiles) {
+        final Path snapshotRoot;
+        try {
+            snapshotRoot = sourceDirectory.toRealPath();
+        }
+        catch (IOException e) {
+            LOG.warn("OpenSCAD preview: could not resolve the source directory " + sourceDirectory, e);
+            return Map.of();
+        }
+
+        final Map<String, byte[]> assets = new LinkedHashMap<>();
+        final long[] totalBytes = {0};
+
+        try {
+            Files.walkFileTree(snapshotRoot, new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult visitFile(@NotNull final Path file, @NotNull final BasicFileAttributes attributes) throws IOException {
+                    final Path canonicalPath = file.toRealPath();
+                    if (!canonicalPath.startsWith(snapshotRoot)) {
+                        LOG.warn("OpenSCAD preview: ignoring file outside the source directory: " + file);
+                        return FileVisitResult.CONTINUE;
+                    }
+                    if (!attributes.isRegularFile()) {
+                        return FileVisitResult.CONTINUE;
+                    }
+
+                    final Path relativePath = snapshotRoot.relativize(file.toAbsolutePath().normalize());
+                    if (relativePath.isAbsolute() || relativePath.startsWith("..")) {
+                        LOG.warn("OpenSCAD preview: ignoring file with an invalid relative path: " + file);
+                        return FileVisitResult.CONTINUE;
+                    }
+                    final String virtualPath = virtualDirectory + "/" + relativePath.toString().replace(
+                            java.io.File.separatorChar,
+                            '/'
+                    );
+                    final long remainingBytes = MAX_PREVIEW_ASSET_BYTES - totalBytes[0];
+                    if (sourceFiles.containsKey(virtualPath)) {
+                        final long sourceBytes = sourceFiles.get(virtualPath).getBytes(StandardCharsets.UTF_8).length;
+                        if (sourceBytes > remainingBytes) {
+                            throw new PreviewAssetLimitException();
+                        }
+                        totalBytes[0] += sourceBytes;
+                        return FileVisitResult.CONTINUE;
+                    }
+
+                    final byte[] content = readAsset(file, remainingBytes);
+                    totalBytes[0] += content.length;
+                    assets.put(virtualPath, content);
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFileFailed(@NotNull final Path file, @NotNull final IOException exception) {
+                    LOG.warn("OpenSCAD preview: could not snapshot " + file, exception);
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        }
+        catch (PreviewAssetLimitException e) {
+            throw e;
+        }
+        catch (IOException e) {
+            LOG.warn("OpenSCAD preview: could not snapshot files under " + snapshotRoot, e);
+        }
+        return assets;
+    }
+
+    @NotNull
+    private static byte[] readAsset(@NotNull final Path file, final long remainingBytes) throws IOException {
+        final long reportedSize = Files.size(file);
+        if (reportedSize > remainingBytes) {
+            throw new PreviewAssetLimitException();
+        }
+        final int initialCapacity = (int)Math.min(reportedSize, 8192);
+        final ByteArrayOutputStream content = new ByteArrayOutputStream(initialCapacity);
+        final byte[] buffer = new byte[8192];
+        try (InputStream input = Files.newInputStream(file, LinkOption.NOFOLLOW_LINKS)) {
+            int bytesRead;
+            while ((bytesRead = input.read(buffer)) != -1) {
+                if ((long)content.size() + bytesRead > remainingBytes) {
+                    throw new PreviewAssetLimitException();
+                }
+                content.write(buffer, 0, bytesRead);
+            }
+        }
+        return content.toByteArray();
+    }
+
+    static final class PreviewAssetLimitException extends RuntimeException {
+        private PreviewAssetLimitException() {
+            super(PREVIEW_ASSET_LIMIT_MESSAGE);
+        }
+    }
+
+    @NotNull
+    private static String parentVirtualPath(@NotNull final String mainPath) {
+        final int separator = mainPath.lastIndexOf('/');
+        return separator > WORK_ROOT.length() ? mainPath.substring(0, separator) : WORK_ROOT;
     }
 
     static boolean requiresPreviewFonts(@NotNull final Map<String, String> files) {

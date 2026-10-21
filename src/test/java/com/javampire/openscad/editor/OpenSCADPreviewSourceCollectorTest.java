@@ -1,13 +1,18 @@
 package com.javampire.openscad.editor;
 
 import com.intellij.testFramework.fixtures.BasePlatformTestCase;
+import com.intellij.openapi.util.io.FileUtil;
 import com.javampire.openscad.settings.OpenSCADSettings;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 public class OpenSCADPreviewSourceCollectorTest extends BasePlatformTestCase {
 
@@ -36,6 +41,84 @@ public class OpenSCADPreviewSourceCollectorTest extends BasePlatformTestCase {
         assertEquals("/work/models/main.scad", sources.mainPath());
         assertTrue(sources.files().containsKey("/work/models/main.scad"));
         assertTrue(sources.files().containsKey("/work/lib/part.scad"));
+    }
+
+    public void testCollectsBinaryAssetsForComputedImportPath() throws IOException {
+        final Path sourceDirectory = Files.createTempDirectory("openscad-preview-assets");
+        try {
+            final String source = """
+                    asset = str("assets/", "nested/mesh.stl");
+                    import(asset);
+                    """;
+            Files.writeString(sourceDirectory.resolve("main.scad"), source);
+            final Path assetPath = sourceDirectory.resolve("assets/nested/mesh.stl");
+            final byte[] assetBytes = {0, 1, 2, (byte)0xff, 0, 127};
+            Files.createDirectories(assetPath.getParent());
+            Files.write(assetPath, assetBytes);
+
+            final var assets = OpenSCADPreviewSourceCollector.collectAssets(
+                    sourceDirectory,
+                    "/work/models",
+                    Map.of("/work/models/main.scad", source)
+            );
+
+            assertTrue(Arrays.equals(assetBytes, assets.get("/work/models/assets/nested/mesh.stl")));
+            assertFalse(assets.containsKey("/work/models/main.scad"));
+        }
+        finally {
+            FileUtil.delete(sourceDirectory);
+        }
+    }
+
+    public void testCollectSkipsSymlinkOutsideSourceDirectory() throws IOException {
+        final Path sourceDirectory = Files.createTempDirectory("openscad-preview-contained");
+        final Path outsideDirectory = Files.createTempDirectory("openscad-preview-outside");
+        final Path outsideAsset = Files.write(outsideDirectory.resolve("secret.stl"), new byte[]{1, 2, 3});
+        final Path symlink = sourceDirectory.resolve("secret.stl");
+        try {
+            try {
+                Files.createSymbolicLink(symlink, outsideAsset);
+            }
+            catch (IOException | UnsupportedOperationException e) {
+                org.junit.Assume.assumeNoException(e);
+            }
+
+            final var assets = OpenSCADPreviewSourceCollector.collectAssets(
+                    sourceDirectory,
+                    "/work/models",
+                    Map.of()
+            );
+
+            assertFalse(assets.containsKey("/work/models/secret.stl"));
+        }
+        finally {
+            Files.deleteIfExists(symlink);
+            FileUtil.delete(sourceDirectory);
+            FileUtil.delete(outsideDirectory);
+        }
+    }
+
+    public void testCollectReportsAssetSizeLimit() throws IOException {
+        final Path sourceDirectory = Files.createTempDirectory("openscad-preview-size-limit");
+        final Path oversizedAsset = sourceDirectory.resolve("oversized.bin");
+        try (FileChannel channel = FileChannel.open(
+                oversizedAsset,
+                StandardOpenOption.CREATE_NEW,
+                StandardOpenOption.WRITE
+        )) {
+            channel.position(OpenSCADPreviewSourceCollector.MAX_PREVIEW_ASSET_BYTES);
+            channel.write(ByteBuffer.wrap(new byte[]{1}));
+        }
+        try {
+            OpenSCADPreviewSourceCollector.collectAssets(sourceDirectory, "/work/models", Map.of());
+            fail("Expected the asset size limit to be reported");
+        }
+        catch (OpenSCADPreviewSourceCollector.PreviewAssetLimitException e) {
+            assertTrue(e.getMessage().contains("128 MiB"));
+        }
+        finally {
+            FileUtil.delete(sourceDirectory);
+        }
     }
 
     public void testCollectRelativeUseImports() {
