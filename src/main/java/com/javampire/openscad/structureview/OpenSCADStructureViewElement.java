@@ -9,6 +9,7 @@ import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.psi.NavigatablePsiElement;
 import com.intellij.psi.PsiElement;
 import com.intellij.psi.util.PsiTreeUtil;
+import com.intellij.util.PsiNavigateUtil;
 import com.javampire.openscad.psi.*;
 import org.jetbrains.annotations.NotNull;
 
@@ -32,7 +33,7 @@ public class OpenSCADStructureViewElement implements StructureViewTreeElement, S
 
     @Override
     public void navigate(boolean requestFocus) {
-        element.navigate(requestFocus);
+        PsiNavigateUtil.navigate(element, requestFocus);
     }
 
     @Override

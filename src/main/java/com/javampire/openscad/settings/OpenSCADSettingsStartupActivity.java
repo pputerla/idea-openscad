@@ -134,7 +134,11 @@ public class OpenSCADSettingsStartupActivity {
                             final VirtualFile file = fileEditor.getFile();
                             if (file.getFileType() == OpenSCADFileType.INSTANCE) {
                                 fileEditorManager.closeFile(file);
-                                fileEditorManager.openFile(file, fileEditorManager.getSelectedEditor() == fileEditor);
+                                reopenFile(
+                                        fileEditorManager,
+                                        file,
+                                        fileEditorManager.getSelectedEditor() == fileEditor
+                                );
                             }
                         }
                     }
@@ -147,6 +151,35 @@ public class OpenSCADSettingsStartupActivity {
                 )
         );
         return previewNotification;
+    }
+
+    private static void reopenFile(
+            @NotNull final FileEditorManager fileEditorManager,
+            @NotNull final VirtualFile file,
+            final boolean requestFocus
+    ) {
+        try {
+            // The asynchronous open API is unavailable in the minimum supported IDE build.
+            final Class<?> requestClass = Class.forName("com.intellij.openapi.fileEditor.FileEditorOpenRequest");
+            final Object request = requestClass.getMethod("withFocus", boolean.class).invoke(null, requestFocus);
+            FileEditorManager.class
+                    .getMethod("requestOpenFile", VirtualFile.class, requestClass)
+                    .invoke(fileEditorManager, file, request);
+        }
+        catch (ClassNotFoundException | NoSuchMethodException e) {
+            try {
+                FileEditorManager.class
+                        .getMethod("openFile", VirtualFile.class, boolean.class)
+                        .invoke(fileEditorManager, file, requestFocus);
+            }
+            catch (ReflectiveOperationException fallbackException) {
+                fallbackException.addSuppressed(e);
+                throw new IllegalStateException("Could not reopen OpenSCAD editor for " + file.getPath(), fallbackException);
+            }
+        }
+        catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Could not reopen OpenSCAD editor for " + file.getPath(), e);
+        }
     }
 
     public static void updateOpenSCADLibraries(final Project project) {
